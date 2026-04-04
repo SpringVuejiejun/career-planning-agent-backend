@@ -376,60 +376,7 @@ def create_agent(streaming: bool = True) -> AgentExecutor:
     
     return agent_executor
 
-
-def extract_json_from_response(content: str) -> Dict[str, Any]:
-    """从 Agent 回复中提取 JSON"""
-    
-    # 尝试直接解析
-    try:
-        return json.loads(content)
-    except:
-        pass
-    
-    # 尝试提取 JSON 块
-    json_pattern = r'\{[^{}]*\}'
-    matches = re.findall(json_pattern, content, re.DOTALL)
-    
-    for match in matches:
-        try:
-            return json.loads(match)
-        except:
-            continue
-    
-    # 如果都失败，返回默认结构
-    return {
-        "type": "reply",
-        "content": content,
-        "key_points": [],
-        "suggestions": [],
-        "data": {},
-        "needs_more_info": False,
-        "follow_up_question": ""
-    }
-
-
 # ========== 主要流式接口 ==========
-async def get_reply(history: list[dict[str, str]]) -> Dict[str, Any]:
-    """非流式获取完整回复（返回最终的结构化 JSON）"""
-    final_result = None
-    async for chunk in stream_reply(history):
-        if chunk.get("is_final"):
-            final_result = chunk
-    return final_result or {
-        "type": "error",
-        "content": "未能获取到有效回复",
-        "is_final": True
-    }
-
-# agent.py - 修改 stream_reply 函数
-
-import re
-from collections.abc import AsyncIterator
-from typing import Dict, Any, List
-from datetime import datetime
-
-# ... 其他导入保持不变 ...
-
 def extract_key_points_from_text(text: str) -> List[str]:
     """从自然语言文本中提取关键点"""
     if not text:
@@ -558,39 +505,7 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
                         "content": chunk.content,
                         "is_final": False
                     }
-            
-            # 捕获工具调用开始 - 显示简化的状态
-            elif event["event"] == "on_tool_start":
-                tool_name = event.get("name", "")
-                # 将工具名转换为用户友好的提示
-                tool_display = {
-                    "get_job_market_info": "正在查询就业市场信息",
-                    "get_skill_requirements": "正在查询技能要求",
-                    "get_company_recruitment": "正在查询公司招聘信息",
-                    "get_certificate_info": "正在查询证书信息",
-                }.get(tool_name, f"正在查询{tool_name}")
-                
-                # 发送工具状态（前端可以显示 loading 提示）
-                yield {
-                    "type": "tool_status",
-                    "content": tool_display,
-                    "tool": tool_name,
-                    "status": "running",
-                    "is_final": False
-                }
-                has_shown_tool_status = True
-            
-            # 捕获工具调用结束 - 可以发送完成状态（可选）
-            elif event["event"] == "on_tool_end":
-                tool_name = event.get("name", "")
-                yield {
-                    "type": "tool_status",
-                    "content": "查询完成",
-                    "tool": tool_name,
-                    "status": "completed",
-                    "is_final": False
-                }
-        
+
         # 整合完整响应
         final_content = "".join(full_response)
         
@@ -613,7 +528,6 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
             "suggestions": suggestions,
             "data": {},
             "is_final": True,
-            "timestamp": datetime.now().isoformat()
         }
         
         yield structured_output
