@@ -1,24 +1,33 @@
+# agent.py
+import json
+import re
 from collections.abc import AsyncIterator
+from typing import Dict, Any, List, Optional, AsyncGenerator
+from datetime import datetime
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from app.config import get_base_url, get_model_name, get_openai_api_key
+from app.config import get_base_url, get_model_name, get_openai_api_key, get_system_prompt
 
-SYSTEM_PROMPT = """你是一位专注服务中国大学生的职业规划顾问智能体。你的目标是帮助学生澄清职业方向、制定可执行的路径，并在求职与学业之间做出平衡。
+# 引入RAG工具，自动调用Milvus进行知识库管理和查询
+from app.rag_client import search_knowledge
 
-原则：
-- 语气友好、专业、具体；避免空泛鸡汤。
-- 先理解学生的专业背景、年级、兴趣与约束（城市、家庭、经济等），再给出建议。
-- 需要更多信息时，用 1–3 个简短问题追问，而不是一次问太多。
-- 涉及薪资、行业前景时说明这是粗略区间且因地区与时间变化，建议结合官方数据与校招信息核实。
-- 不代替正式心理咨询；若用户表现出严重心理危机倾向，应建议联系学校心理中心或专业机构。
-- 回答使用简体中文，除非用户明确要求其他语言。
-"""
+# 工具调用
+from app.tools.jobMarketInfoTool import get_job_market_info
+from app.tools.skillRequirementTool import get_skill_requirements
+from app.tools.companyRecruitmentTool import get_company_recruitment
+from app.tools.certificateInfoTool import get_certificate_info
+from app.tools.milvusCodeTool import run_milvus_code
 
+# ========== 辅助函数 ==========
 
 def build_messages(history: list[dict[str, str]]) -> list[BaseMessage]:
-    out: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+    """构建消息历史"""
+    out: list[BaseMessage] = [SystemMessage(content=get_system_prompt())]
     for m in history:
         role = m.get("role", "")
         content = (m.get("content") or "").strip()
@@ -31,23 +40,306 @@ def build_messages(history: list[dict[str, str]]) -> list[BaseMessage]:
     return out
 
 
-def create_llm(*, streaming: bool) -> ChatOpenAI:
-    kwargs: dict = {
+def create_llm(*, streaming: bool = True, temperature: float = 0.7) -> ChatOpenAI:
+    kwargs: Dict[str, Any] = {
         "model": get_model_name(),
         "api_key": get_openai_api_key(),
         "streaming": streaming,
-        "temperature": 0.7,
+        "temperature": temperature,
     }
     base = get_base_url()
-    if base:
+    if(base):
         kwargs["base_url"] = base
     return ChatOpenAI(**kwargs)
 
 
-async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[str]:
-    llm = create_llm(streaming=True)
-    messages = build_messages(history)
-    async for chunk in llm.astream(messages):
-        text = chunk.content
-        if isinstance(text, str) and text:
-            yield text
+def create_agent(streaming: bool = True) -> AgentExecutor:
+    # 创建 Agent Executor
+    llm = create_llm(streaming=streaming)
+
+    tools = [
+        get_job_market_info,
+        get_skill_requirements,
+        get_company_recruitment,
+        get_certificate_info,
+        run_milvus_code,
+    ]
+
+    prompt = ChatPromptTemplate.from_messages([
+        ('system', get_system_prompt()),
+        MessagesPlaceholder(variable_name='chat_history'),
+        ('user', '{input}'),
+        MessagesPlaceholder(variable_name='agent_scratchpad')
+    ])
+
+    agent = create_openai_tools_agent(llm, tools, prompt)
+
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=False,
+        handle_parsing_errors=True,
+        max_iterations=5,
+    )
+
+    return agent_executor
+
+
+# ========== RAG 检索增强函数 ==========
+
+async def enhance_query_with_rag(user_query: str, top_k: int = 3) -> tuple[str, List[Dict[str, Any]]]:
+    """
+    使用 RAG 检索增强用户查询
+    
+    返回:
+        - enhanced_query: 增强后的查询文本（包含检索到的上下文）
+        - retrieved_docs: 检索到的文档列表
+    """
+    try:
+        # 从知识库检索相关内容
+        search_result = await search_knowledge(user_query, top_k=top_k)
+        
+        # 解析搜索结果
+        retrieved_docs = []
+        context_parts = []
+        
+        # 如果搜索结果不为空且不是错误信息
+        if search_result and "未找到" not in search_result and "失败" not in search_result:
+            # 解析搜索结果中的内容
+            # search_knowledge 返回格式化的文本，需要提取关键信息
+            lines = search_result.split('\n')
+            current_doc = {}
+            
+            for line in lines:
+                if '【' in line and '】' in line and '相似度' in line:
+                    if current_doc:
+                        retrieved_docs.append(current_doc)
+                        current_doc = {}
+                elif '问题:' in line:
+                    current_doc['question'] = line.split('问题:')[1].strip()
+                elif '答案:' in line:
+                    current_doc['answer'] = line.split('答案:')[1].strip()
+                elif '分类:' in line:
+                    current_doc['category'] = line.split('分类:')[1].strip()
+            
+            if current_doc:
+                retrieved_docs.append(current_doc)
+            
+            # 构建上下文
+            for i, doc in enumerate(retrieved_docs, 1):
+                context_parts.append(f"""
+【参考知识 {i}】
+问题：{doc.get('question', '')}
+答案：{doc.get('answer', '')}
+分类：{doc.get('category', '')}
+""")
+            
+            if context_parts:
+                # 构建增强后的查询
+                enhanced_query = f"""
+用户问题：{user_query}
+
+以下是知识库中相关的参考信息，请基于这些信息（结合你的专业知识）来回答用户问题：
+
+{chr(10).join(context_parts)}
+
+请综合以上参考信息，给出准确、详细的回答。如果参考信息不足以回答用户问题，请结合你的专业知识进行补充。
+"""
+                return enhanced_query, retrieved_docs
+        
+        return user_query, []
+        
+    except Exception as e:
+        print(f"RAG 检索失败: {e}")
+        return user_query, []
+
+
+def extract_key_points_from_text(text: str) -> List[str]:
+    """从自然语言文本中提取关键点"""
+    if not text:
+        return []
+    
+    key_points = []
+    
+    # 方法1：查找以数字或特殊符号开头的列表项
+    bullet_patterns = [
+        r'[•·\-*]\s*([^。\n]+)',  # • 项目符号
+        r'(\d+)[.、）\)]\s*([^。\n]+)',  # 1. 2) 等
+        r'[（(]\d+[）)]\s*([^。\n]+)',  # (1) 等
+    ]
+    
+    for pattern in bullet_patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            # 如果是元组，取最后一个（非数字部分）
+            point = match if isinstance(match, str) else match[-1]
+            point = point.strip()
+            if point and len(point) > 5 and len(point) < 100:
+                key_points.append(point)
+            if len(key_points) >= 3:
+                return key_points[:3]
+    
+    # 方法2：查找包含关键词的句子
+    keywords = ['重点', '关键', '主要', '包括', '例如', '比如', '特别是', '尤其是']
+    sentences = re.split(r'[。！？；]', text)
+    
+    for sent in sentences:
+        sent = sent.strip()
+        if len(sent) > 10 and len(sent) < 100:
+            if any(kw in sent for kw in keywords):
+                key_points.append(sent)
+            if len(key_points) >= 3:
+                return key_points[:3]
+    
+    # 方法3：取前几个有意义的句子
+    if not key_points and sentences:
+        for sent in sentences[:3]:
+            sent = sent.strip()
+            if len(sent) > 10 and len(sent) < 100:
+                key_points.append(sent)
+    
+    return key_points[:3]
+
+
+def extract_suggestions_from_text(text: str) -> List[str]:
+    """从自然语言文本中提取建议"""
+    if not text:
+        return []
+    
+    suggestions = []
+    
+    # 查找"建议"相关的段落
+    if '建议' in text:
+        # 分割文本
+        parts = re.split(r'[。！？；]', text)
+        
+        for part in parts:
+            if '建议' in part:
+                # 提取建议内容
+                suggestion = part.strip()
+                # 清理前缀
+                suggestion = re.sub(r'^.*?建议[：:]?\s*', '', suggestion)
+                if suggestion and len(suggestion) > 5 and len(suggestion) < 150:
+                    suggestions.append(suggestion)
+            
+            if len(suggestions) >= 2:
+                break
+    
+    # 如果没有找到，查找包含"可以"、"需要"、"应该"的句子
+    if not suggestions:
+        keywords = ['可以', '需要', '应该', '推荐', '最好']
+        sentences = re.split(r'[。！？；]', text)
+        
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent) > 5 and len(sent) < 100:
+                if any(kw in sent for kw in keywords):
+                    suggestions.append(sent)
+                if len(suggestions) >= 2:
+                    break
+    
+    return suggestions[:2]
+
+
+async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str, Any]]:
+    """
+    流式生成回复 - 自动使用 RAG 检索增强用户问题
+    流程：用户提问 → RAG检索 → 增强查询 → Agent回答
+    """
+    
+    # 获取最新的用户输入
+    user_input = ""
+    for m in reversed(history):
+        if m.get("role") == "user":
+            user_input = m.get("content", "")
+            break
+    
+    # ========== 步骤1: RAG 检索增强 ==========
+    # 发送 RAG 检索开始状态
+    yield {
+        "type": "rag_status",
+        "content": "🔍 正在检索知识库...",
+        "is_final": False
+    }
+    
+    # 执行 RAG 检索
+    enhanced_query, retrieved_docs = await enhance_query_with_rag(user_input, top_k=3)
+    
+    # 如果有检索到相关内容，发送检索结果摘要
+    if retrieved_docs:
+        print(retrieved_docs,"检索文献")
+        yield {
+            "type": "rag_result",
+            "content": f"📚 找到 {len(retrieved_docs)} 条相关知识，正在生成回答...",
+            "retrieved_count": len(retrieved_docs),
+            "is_final": False
+        }
+    else:
+        yield {
+            "type": "rag_result",
+            "content": "💡 未找到直接相关知识，将使用通用知识回答...",
+            "is_final": False
+        }
+    
+    # ========== 步骤2: 使用增强后的查询调用 Agent ==========
+    agent_executor = create_agent(streaming=True)
+    
+    # 构建消息历史（保留之前的对话，但用增强后的查询替换当前用户输入）
+    chat_history = build_messages(history[:-1]) if len(history) > 1 else []
+    
+    # 收集完整的响应
+    full_response = []
+    
+    try:
+        async for event in agent_executor.astream_events(
+            {
+                "input": enhanced_query,  # 使用增强后的查询
+                "chat_history": chat_history,
+            },
+            version="v1"
+        ):
+            # 捕获 LLM 流式输出
+            if event["event"] == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if chunk.content:
+                    full_response.append(chunk.content)
+                    
+                    # 实时流式输出
+                    yield {
+                        "type": "streaming",
+                        "content": chunk.content,
+                        "is_final": False
+                    }
+
+        # 整合完整响应
+        final_content = "".join(full_response)
+        
+        # 如果内容为空，返回默认回复
+        if not final_content or len(final_content.strip()) < 10:
+            final_content = "抱歉，我没有理解你的问题，请再详细说明一下你的专业和具体需求。"
+        
+        # 自动提取关键点和建议
+        key_points = extract_key_points_from_text(final_content)
+        suggestions = extract_suggestions_from_text(final_content)
+        
+        # 最终结构化输出
+        structured_output = {
+            "type": "reply",
+            "content": final_content,
+            "key_points": key_points,
+            "suggestions": suggestions,
+            "retrieved_docs": retrieved_docs,  # 添加检索到的文档信息
+            "data": {},
+            "is_final": True,
+        }
+        
+        yield structured_output
+        
+    except Exception as e:
+        error_msg = f"抱歉，处理你的请求时出现了问题：{str(e)}"
+        yield {
+            "type": "error",
+            "content": error_msg,
+            "is_final": True,
+            "error": str(e)
+        }
