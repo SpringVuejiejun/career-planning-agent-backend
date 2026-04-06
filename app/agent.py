@@ -11,371 +11,23 @@ from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from app.config import get_base_url, get_model_name, get_openai_api_key
-# 引入milvus向量数据库
-from app.sandbox_client import execute_python_code, search_vectors_code, insert_vectors_code, create_collection_code
+from app.config import get_base_url, get_model_name, get_openai_api_key, get_system_prompt
+
 # 引入RAG工具，自动调用Milvus进行知识库管理和查询
-from app.rag_client import (
-    init_knowledge_base,
-    insert_knowledge,
-    search_knowledge,
-    get_stats
-)
+from app.rag_client import search_knowledge
 
-# ========== 系统提示词（要求结构化输出） ==========
-SYSTEM_PROMPT = """你是一位专注服务中国大学生的职业规划顾问智能体。
-
-## 回答要求
-- **直接输出自然语言回答**，不要输出任何 JSON 格式
-- **不要输出思考过程**，直接给出最终答案
-- **不要输出工具调用信息**（如"已查询xxx"）
-- **必须搜索知识库再回答**（如"从知识库中检索到xxx"）
-- 语气友好、专业、具体
-- 回答使用简体中文
-
-## 回答示例
-
-用户问："计算机专业就业怎么样？"
-你回答：
-计算机专业的就业前景非常好，尤其是在北京、上海、深圳等一线城市。平均起薪在15-25k之间，就业率超过90%。建议提前刷LeetCode，多积累项目经验，关注秋招时间8-10月。
-
-用户问："字节跳动的校招信息"
-你回答：
-字节跳动的校招主要集中在每年8月到10月，部分岗位在春招也会有补录。面试时非常看重算法能力，LeetCode中等难度的题比较常见，还会深入追问项目经历。岗位包括后端、前端、算法、客户端等，工作地点在北京、上海、深圳、杭州、广州都能选。
-
-## 工作原则
-- 需要更多信息时，直接追问用户
-- 涉及数据时尽量具体
-"""
-
-
-# ========== 定义工具 ==========
-
-@tool
-async def get_job_market_info(major: str, city: str = "全国") -> str:
-    """
-    获取指定专业在特定城市的就业市场信息。
-    
-    参数:
-        major: 专业名称，如"计算机科学与技术"、"金融学"等
-        city: 城市名称，默认为"全国"
-    
-    返回:
-        包含薪资、就业率、主要行业等的就业信息
-    """
-    # 模拟数据（实际使用时替换为真实API）
-    market_data = {
-        "计算机科学与技术": {
-            "全国": {
-                "salary": "15-25k",
-                "rate": "92%",
-                "industries": ["互联网", "金融科技", "国企IT"],
-                "description": "就业前景广阔，薪资待遇好"
-            },
-            "北京": {
-                "salary": "18-30k",
-                "rate": "94%",
-                "industries": ["互联网大厂", "金融IT", "人工智能"],
-                "description": "大厂集中，机会多"
-            },
-            "上海": {
-                "salary": "17-28k",
-                "rate": "93%",
-                "industries": ["金融科技", "互联网", "外企"],
-                "description": "金融和互联网并重"
-            },
-            "深圳": {
-                "salary": "18-28k",
-                "rate": "95%",
-                "industries": ["硬件科技", "互联网", "通信"],
-                "description": "科技公司聚集地"
-            }
-        },
-        "金融学": {
-            "全国": {
-                "salary": "10-20k",
-                "rate": "85%",
-                "industries": ["银行", "证券", "基金"],
-                "description": "稳定但竞争激烈"
-            },
-            "上海": {
-                "salary": "15-25k",
-                "rate": "88%",
-                "industries": ["投行", "基金", "信托"],
-                "description": "金融中心，高端岗位多"
-            },
-            "北京": {
-                "salary": "14-24k",
-                "rate": "87%",
-                "industries": ["银行总部", "券商", "监管机构"],
-                "description": "总部经济，稳定性好"
-            }
-        }
-    }
-    
-    if major not in market_data:
-        return json.dumps({
-            "error": True,
-            "message": f"暂时没有{major}专业的详细就业数据",
-            "suggestion": "建议查看教育部官方就业报告或学校就业指导中心"
-        }, ensure_ascii=False)
-    
-    city_data = market_data[major].get(city, market_data[major]["全国"])
-    
-    return json.dumps({
-        "error": False,
-        "major": major,
-        "city": city,
-        "salary": city_data["salary"],
-        "employment_rate": city_data["rate"],
-        "industries": city_data["industries"],
-        "description": city_data["description"]
-    }, ensure_ascii=False)
-
-
-@tool
-async def get_skill_requirements(job_title: str) -> str:
-    """
-    获取特定职位所需的技能要求。
-    
-    参数:
-        job_title: 职位名称，如"前端开发工程师"、"产品经理"等
-    
-    返回:
-        该职位的技能要求、学习路径和建议
-    """
-    skills_data = {
-        "后端开发工程师": {
-            "core_skills": ["Java/Go/Python", "数据库", "Linux", "分布式系统"],
-            "learning_path": ["语言基础(1-2月)", "框架学习(2-3月)", "项目实战(2-3月)"],
-            "salary_range": "20-35k",
-            "difficulty": "较高"
-        },
-        "前端开发工程师": {
-            "core_skills": ["HTML/CSS/JS", "React/Vue", "构建工具", "浏览器原理"],
-            "learning_path": ["基础三件套(2-3月)", "框架进阶(2-3月)", "工程化(1-2月)"],
-            "salary_range": "18-30k",
-            "difficulty": "中等"
-        },
-        "算法工程师": {
-            "core_skills": ["Python", "机器学习", "深度学习", "数据结构"],
-            "learning_path": ["数学基础(2-3月)", "ML/DL算法(3-4月)", "论文复现(2-3月)"],
-            "salary_range": "25-45k",
-            "difficulty": "高"
-        },
-        "产品经理": {
-            "core_skills": ["用户研究", "原型设计", "数据分析", "沟通协调"],
-            "learning_path": ["产品思维(1-2月)", "工具使用(1月)", "实战项目(2-3月)"],
-            "salary_range": "15-30k",
-            "difficulty": "中等"
-        }
-    }
-    
-    if job_title not in skills_data:
-        return json.dumps({
-            "error": True,
-            "message": f"暂时没有{job_title}的详细技能要求",
-            "suggestion": "建议查看招聘网站或行业报告"
-        }, ensure_ascii=False)
-    
-    data = skills_data[job_title]
-    return json.dumps({
-        "error": False,
-        "job_title": job_title,
-        "core_skills": data["core_skills"],
-        "learning_path": data["learning_path"],
-        "salary_range": data["salary_range"],
-        "difficulty": data["difficulty"]
-    }, ensure_ascii=False)
-
-
-@tool
-async def get_company_recruitment(company_name: str, job_type: str = "校招") -> str:
-    """
-    查询特定公司的校招/实习信息。
-    
-    参数:
-        company_name: 公司名称，如"字节跳动"、"腾讯"
-        job_type: 职位类型，可选"实习"、"校招"，默认为"校招"
-    
-    返回:
-        该公司的招聘信息和申请建议
-    """
-    companies_data = {
-        "字节跳动": {
-            "校招": {
-                "time": "8-10月（秋招），3-4月（春招补录）",
-                "key_points": ["非常注重算法能力", "项目深度追问", "技术栈灵活"],
-                "interviews": ["LeetCode中等/困难", "系统设计", "项目深挖"],
-                "positions": ["后端", "前端", "算法", "客户端", "测开", "产品"],
-                "locations": ["北京", "上海", "深圳", "杭州", "广州"],
-                "tips": ["刷LeetCode150题以上", "准备项目难点和优化思路", "关注官方招聘号"]
-            },
-            "实习": {
-                "time": "全年可投，暑期实习机会最多",
-                "key_points": ["转正机会大", "面试难度略低于校招", "看重基础"],
-                "interviews": ["LeetCode简单/中等", "基础知识", "项目经验"],
-                "positions": ["技术岗为主", "产品岗", "运营岗"],
-                "locations": ["北京", "上海", "深圳"],
-                "tips": ["提前3-6个月准备", "争取内推", "实习经历很重要"]
-            }
-        },
-        "腾讯": {
-            "校招": {
-                "time": "8-10月（秋招），3-4月（春招）",
-                "key_points": ["注重计算机基础", "C++/Go技术栈", "重视项目"],
-                "interviews": ["操作系统", "网络", "算法", "项目"],
-                "positions": ["后端", "客户端", "游戏开发", "产品"],
-                "locations": ["深圳", "北京", "上海", "广州", "成都"],
-                "tips": ["加强C++", "准备网络和操作系统", "有开源经历加分"]
-            }
-        },
-        "阿里巴巴": {
-            "校招": {
-                "time": "7-9月（秋招），3-4月（春招）",
-                "key_points": ["Java技术栈", "重视中间件", "看重项目"],
-                "interviews": ["Java基础", "JVM", "并发", "框架源码"],
-                "positions": ["后端", "前端", "算法", "测试"],
-                "locations": ["杭州", "北京", "上海", "深圳"],
-                "tips": ["精通Java", "研究Spring源码", "有高并发经验加分"]
-            }
-        }
-    }
-    
-    if company_name not in companies_data:
-        return json.dumps({
-            "error": True,
-            "message": f"暂时没有{company_name}的详细招聘信息",
-            "suggestion": "建议关注公司官网招聘页面或牛客网"
-        }, ensure_ascii=False)
-    
-    company = companies_data[company_name]
-    info = company.get(job_type, company.get("校招", {}))
-    
-    return json.dumps({
-        "error": False,
-        "company": company_name,
-        "job_type": job_type,
-        "recruitment_time": info.get("time", "关注官方通知"),
-        "key_points": info.get("key_points", []),
-        "interview_focus": info.get("interviews", []),
-        "positions": info.get("positions", []),
-        "locations": info.get("locations", []),
-        "tips": info.get("tips", [])
-    }, ensure_ascii=False)
-
-
-@tool
-async def get_certificate_info(cert_name: str) -> str:
-    """
-    查询职业认证证书的相关信息。
-    
-    参数:
-        cert_name: 证书名称，如"PMP"、"CPA"
-    
-    返回:
-        证书的价值、考试要求
-    """
-    certs_data = {
-        "PMP": {
-            "full_name": "项目管理专业人士认证",
-            "value": "国际认可，适合有经验的项目经理",
-            "requirements": "35学时培训 + 考试经验",
-            "cost": "约3900元",
-            "difficulty": "中等",
-            "time": "3-6个月准备"
-        },
-        "CPA": {
-            "full_name": "注册会计师",
-            "value": "国内含金量最高，财会领域必备",
-            "requirements": "专科以上学历",
-            "cost": "每科约70元",
-            "difficulty": "高",
-            "time": "2-3年"
-        },
-        "软考": {
-            "full_name": "计算机技术与软件专业技术资格",
-            "value": "国企事业单位认可，可评职称",
-            "requirements": "无学历要求",
-            "cost": "约200元",
-            "difficulty": "中等",
-            "time": "2-3个月"
-        }
-    }
-    
-    if cert_name not in certs_data:
-        return json.dumps({
-            "error": True,
-            "message": f"暂时没有{cert_name}的详细信息",
-            "suggestion": "建议查看官方考试网站"
-        }, ensure_ascii=False)
-    
-    data = certs_data[cert_name]
-    return json.dumps({
-        "error": False,
-        "cert_name": cert_name,
-        "full_name": data["full_name"],
-        "value": data["value"],
-        "requirements": data["requirements"],
-        "cost": data["cost"],
-        "difficulty": data["difficulty"],
-        "preparation_time": data["time"]
-    }, ensure_ascii=False)
-
-@tool
-async def query_career_knowledge(query: str, top_k: int = 5) -> str:
-    """
-    使用向量检索查询职业规划相关的知识库。可以查询职业信息、面试经验、公司信息等。
-    
-    参数:
-        query: 查询问题，如"计算机专业的就业前景"、"字节跳动面试经验"等
-        top_k: 返回最相关的结果数量，默认为5
-    
-    返回:
-        相关的知识库检索结果
-    """
-    # 这里需要将 query 转换为向量（调用 embedding 模型）
-    # 简化版：先用模拟数据，后续可以接入真实的 embedding API
-    # 实际使用中需要调用 OpenAI Embeddings 或本地 embedding 模型
-    
-    # 临时方案：直接返回一个提示，告诉用户需要配置 embedding
-    return json.dumps({
-        "error": False,
-        "message": "Milvus 向量检索功能已就绪",
-        "query": query,
-        "note": "需要配置 embedding 模型来将查询转换为向量",
-        "suggestion": "请配置 OPENAI_API_KEY 或使用本地 embedding 模型"
-    }, ensure_ascii=False)
-
-
-@tool
-async def execute_milvus_code(code: str) -> str:
-    """
-    在安全的 Docker 沙箱中执行自定义的 Milvus 操作代码。适合需要直接操作 Milvus 数据库的场景。
-    
-    参数:
-        code: Python 代码字符串，可以使用 pymilvus 库的所有功能
-    
-    返回:
-        代码执行结果
-    """
-    result = await execute_python_code(code)
-    
-    if result.get("success"):
-        # 返回执行输出，过滤掉 Milvus 连接信息
-        output = result.get("output", "")
-        # 移除连接成功的提示信息
-        import re
-        output = re.sub(r'✓ 成功连接到Milvus: .*\n', '', output)
-        return output if output else "执行成功（无输出）"
-    else:
-        return f"执行失败: {result.get('error', '未知错误')}"
+# 工具调用
+from app.tools.jobMarketInfoTool import get_job_market_info
+from app.tools.skillRequirementTool import get_skill_requirements
+from app.tools.companyRecruitmentTool import get_company_recruitment
+from app.tools.certificateInfoTool import get_certificate_info
+from app.tools.milvusCodeTool import run_milvus_code
 
 # ========== 辅助函数 ==========
 
 def build_messages(history: list[dict[str, str]]) -> list[BaseMessage]:
     """构建消息历史"""
-    out: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+    out: list[BaseMessage] = [SystemMessage(content=get_system_prompt())]
     for m in history:
         role = m.get("role", "")
         content = (m.get("content") or "").strip()
@@ -389,7 +41,6 @@ def build_messages(history: list[dict[str, str]]) -> list[BaseMessage]:
 
 
 def create_llm(*, streaming: bool = True, temperature: float = 0.7) -> ChatOpenAI:
-    """创建 LLM 实例"""
     kwargs: Dict[str, Any] = {
         "model": get_model_name(),
         "api_key": get_openai_api_key(),
@@ -397,50 +48,112 @@ def create_llm(*, streaming: bool = True, temperature: float = 0.7) -> ChatOpenA
         "temperature": temperature,
     }
     base = get_base_url()
-    if base:
+    if(base):
         kwargs["base_url"] = base
     return ChatOpenAI(**kwargs)
 
 
 def create_agent(streaming: bool = True) -> AgentExecutor:
-    """创建 Agent Executor"""
-    
+    # 创建 Agent Executor
+    llm = create_llm(streaming=streaming)
+
     tools = [
         get_job_market_info,
         get_skill_requirements,
         get_company_recruitment,
         get_certificate_info,
-        execute_milvus_code,
-        # query_career_knowledge,  # 这个工具需要配置 embedding 模型，暂时注释掉
-        # RAG 工具
-        init_knowledge_base,
-        insert_knowledge,
-        search_knowledge,
-        get_stats
+        run_milvus_code,
     ]
-    
-    llm = create_llm(streaming=streaming)
-    
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ('system', get_system_prompt()),
+        MessagesPlaceholder(variable_name='chat_history'),
+        ('user', '{input}'),
+        MessagesPlaceholder(variable_name='agent_scratchpad')
     ])
-    
+
     agent = create_openai_tools_agent(llm, tools, prompt)
-    
+
     agent_executor = AgentExecutor(
         agent=agent,
         tools=tools,
-        verbose=True,  # 生产环境设为False
+        verbose=False,
         handle_parsing_errors=True,
         max_iterations=5,
     )
-    
+
     return agent_executor
 
-# ========== 主要流式接口 ==========
+
+# ========== RAG 检索增强函数 ==========
+
+async def enhance_query_with_rag(user_query: str, top_k: int = 3) -> tuple[str, List[Dict[str, Any]]]:
+    """
+    使用 RAG 检索增强用户查询
+    
+    返回:
+        - enhanced_query: 增强后的查询文本（包含检索到的上下文）
+        - retrieved_docs: 检索到的文档列表
+    """
+    try:
+        # 从知识库检索相关内容
+        search_result = await search_knowledge(user_query, top_k=top_k)
+        
+        # 解析搜索结果
+        retrieved_docs = []
+        context_parts = []
+        
+        # 如果搜索结果不为空且不是错误信息
+        if search_result and "未找到" not in search_result and "失败" not in search_result:
+            # 解析搜索结果中的内容
+            # search_knowledge 返回格式化的文本，需要提取关键信息
+            lines = search_result.split('\n')
+            current_doc = {}
+            
+            for line in lines:
+                if '【' in line and '】' in line and '相似度' in line:
+                    if current_doc:
+                        retrieved_docs.append(current_doc)
+                        current_doc = {}
+                elif '问题:' in line:
+                    current_doc['question'] = line.split('问题:')[1].strip()
+                elif '答案:' in line:
+                    current_doc['answer'] = line.split('答案:')[1].strip()
+                elif '分类:' in line:
+                    current_doc['category'] = line.split('分类:')[1].strip()
+            
+            if current_doc:
+                retrieved_docs.append(current_doc)
+            
+            # 构建上下文
+            for i, doc in enumerate(retrieved_docs, 1):
+                context_parts.append(f"""
+【参考知识 {i}】
+问题：{doc.get('question', '')}
+答案：{doc.get('answer', '')}
+分类：{doc.get('category', '')}
+""")
+            
+            if context_parts:
+                # 构建增强后的查询
+                enhanced_query = f"""
+用户问题：{user_query}
+
+以下是知识库中相关的参考信息，请基于这些信息（结合你的专业知识）来回答用户问题：
+
+{chr(10).join(context_parts)}
+
+请综合以上参考信息，给出准确、详细的回答。如果参考信息不足以回答用户问题，请结合你的专业知识进行补充。
+"""
+                return enhanced_query, retrieved_docs
+        
+        return user_query, []
+        
+    except Exception as e:
+        print(f"RAG 检索失败: {e}")
+        return user_query, []
+
+
 def extract_key_points_from_text(text: str) -> List[str]:
     """从自然语言文本中提取关键点"""
     if not text:
@@ -530,13 +243,9 @@ def extract_suggestions_from_text(text: str) -> List[str]:
 
 async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str, Any]]:
     """
-    流式生成回复 - 显示简化的工具状态，自动提取关键点和建议
+    流式生成回复 - 自动使用 RAG 检索增强用户问题
+    流程：用户提问 → RAG检索 → 增强查询 → Agent回答
     """
-    
-    agent_executor = create_agent(streaming=True)
-    
-    # 构建输入
-    chat_history = build_messages(history[:-1]) if len(history) > 1 else []
     
     # 获取最新的用户输入
     user_input = ""
@@ -545,14 +254,46 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
             user_input = m.get("content", "")
             break
     
+    # ========== 步骤1: RAG 检索增强 ==========
+    # 发送 RAG 检索开始状态
+    yield {
+        "type": "rag_status",
+        "content": "🔍 正在检索知识库...",
+        "is_final": False
+    }
+    
+    # 执行 RAG 检索
+    enhanced_query, retrieved_docs = await enhance_query_with_rag(user_input, top_k=3)
+    
+    # 如果有检索到相关内容，发送检索结果摘要
+    if retrieved_docs:
+        print(retrieved_docs,"检索文献")
+        yield {
+            "type": "rag_result",
+            "content": f"📚 找到 {len(retrieved_docs)} 条相关知识，正在生成回答...",
+            "retrieved_count": len(retrieved_docs),
+            "is_final": False
+        }
+    else:
+        yield {
+            "type": "rag_result",
+            "content": "💡 未找到直接相关知识，将使用通用知识回答...",
+            "is_final": False
+        }
+    
+    # ========== 步骤2: 使用增强后的查询调用 Agent ==========
+    agent_executor = create_agent(streaming=True)
+    
+    # 构建消息历史（保留之前的对话，但用增强后的查询替换当前用户输入）
+    chat_history = build_messages(history[:-1]) if len(history) > 1 else []
+    
     # 收集完整的响应
     full_response = []
-    has_shown_tool_status = False
     
     try:
         async for event in agent_executor.astream_events(
             {
-                "input": user_input,
+                "input": enhanced_query,  # 使用增强后的查询
                 "chat_history": chat_history,
             },
             version="v1"
@@ -563,7 +304,7 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
                 if chunk.content:
                     full_response.append(chunk.content)
                     
-                    # 实时流式输出（只输出内容，不解析）
+                    # 实时流式输出
                     yield {
                         "type": "streaming",
                         "content": chunk.content,
@@ -572,9 +313,6 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
 
         # 整合完整响应
         final_content = "".join(full_response)
-        
-        # 清理内容（移除可能的 JSON 残留）
-        final_content = clean_agent_response(final_content)
         
         # 如果内容为空，返回默认回复
         if not final_content or len(final_content.strip()) < 10:
@@ -590,6 +328,7 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
             "content": final_content,
             "key_points": key_points,
             "suggestions": suggestions,
+            "retrieved_docs": retrieved_docs,  # 添加检索到的文档信息
             "data": {},
             "is_final": True,
         }
@@ -604,30 +343,3 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
             "is_final": True,
             "error": str(e)
         }
-
-
-def clean_agent_response(response: str) -> str:
-    """清理 Agent 响应中的 JSON 残留"""
-    if not response:
-        return ""
-    
-    cleaned = response
-    
-    # 移除可能的 JSON 格式残留
-    cleaned = re.sub(r'\{[^{}]*\}', '', cleaned, flags=re.DOTALL)
-    
-    # 移除 "data: " 前缀
-    cleaned = re.sub(r'^data:\s*', '', cleaned, flags=re.MULTILINE)
-    
-    # 移除多余的引号
-    cleaned = re.sub(r'^"|"$', '', cleaned.strip())
-    
-    # 清理空白
-    cleaned = re.sub(r'\n\s*\n', '\n', cleaned)
-    cleaned = cleaned.strip()
-    
-    # 如果清理后以逗号开头，移除逗号
-    if cleaned.startswith(','):
-        cleaned = cleaned[1:].strip()
-    
-    return cleaned

@@ -34,7 +34,7 @@ class ChatRequest(BaseModel):
 
 
 def _sse_payload(data: dict) -> str:
-    """发送结构化数据而不是纯文本"""
+    # 返回以data: 开头的结构化数据
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -69,8 +69,11 @@ async def chat_stream(body: ChatRequest):
     last = body.messages[-1]
     if last.role != "user":
         raise HTTPException(status_code=400, detail="最后一条消息须为用户输入")
+    # 此时收到的消息是chatMessage类型，需要使用pydantic的model_dump方法转换成字典列表
     history = [m.model_dump() for m in body.messages]
+    # 开始流式输出返回响应
     return StreamingResponse(
+        # 调用sse_stream生成器函数，生成规范的SSE事件流
         sse_stream(history),
         media_type="text/event-stream",
         headers={

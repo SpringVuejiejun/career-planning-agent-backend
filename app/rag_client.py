@@ -8,17 +8,13 @@ from langchain_core.tools import tool
 # 使用阿里云 DashScope Embeddings
 try:
     from langchain_community.embeddings import DashScopeEmbeddings
-    from app.config import get_openai_api_key, get_base_url
+    from app.config import get_dashscope_api_key
     
-    # DashScope 使用不同的 API key 配置
-    # 注意：DashScope 需要 dashscope.api_key 或环境变量 DASHSCOPE_API_KEY
-    # 这里假设你的 OPENAI_API_KEY 实际上就是 DashScope 的 API key
     embeddings = DashScopeEmbeddings(
         model="text-embedding-v1",  # 阿里云文本向量模型
-        dashscope_api_key=get_openai_api_key(),  # 使用你的 API key
+        dashscope_api_key=get_dashscope_api_key(),
     )
     EMBEDDINGS_AVAILABLE = True
-    print("✅ DashScope Embeddings 已加载 (模型: text-embedding-v1)")
 except Exception as e:
     print(f"⚠️ DashScope Embeddings 加载失败: {e}")
     print("将使用模拟向量")
@@ -28,7 +24,7 @@ except Exception as e:
 def get_collection_name() -> str:
     return "career_knowledge_base"
 
-@tool(description="初始化知识库：创建 Milvus Collection 和索引")
+# @tool(description="初始化知识库：创建 Milvus Collection 和索引")
 async def init_knowledge_base() -> str:
     """初始化知识库"""
     collection_name = get_collection_name()
@@ -66,7 +62,7 @@ print(f"✓ Collection '{{collection_name}}' 创建成功 (维度: 1536)")
     output = re.sub(r'✓ 成功连接到Milvus: .*\n', '', output)
     return output
 
-@tool(description="插入知识条目到 Milvus 知识库")
+# @tool(description="插入知识条目到 Milvus 知识库")
 async def insert_knowledge(question: str, answer: str, category: str, keywords: str = "") -> str:
     """插入知识条目"""
     collection_name = get_collection_name()
@@ -109,7 +105,7 @@ print(f"  当前总数: {{collection.num_entities}}")
     output = re.sub(r'✓ 成功连接到Milvus: .*\n', '', output)
     return output
 
-@tool(description="搜索知识库")
+# @tool(description="搜索知识库")
 async def search_knowledge(query: str, top_k: int = 3) -> str:
     """搜索知识库"""
     collection_name = get_collection_name()
@@ -161,7 +157,7 @@ else:
     output = re.sub(r'✓ 成功连接到Milvus: .*\n', '', output)
     return output
 
-@tool(description="获取知识库统计信息")
+# @tool(description="获取知识库统计信息")
 async def get_stats() -> str:
     """获取统计信息"""
     collection_name = get_collection_name()
