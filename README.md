@@ -10,8 +10,7 @@ python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\acti
 pip install -r requirements.txt
 cp .env.example .env
 # 编辑 .env 填入 OPENAI_API_KEY
-
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# 启动项目 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 健康检查：`GET http://127.0.0.1:8000/api/health`
