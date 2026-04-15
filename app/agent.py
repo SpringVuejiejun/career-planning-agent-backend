@@ -158,6 +158,18 @@ def extract_key_points_from_text(text: str) -> List[str]:
     """从自然语言文本中提取关键点"""
     if not text:
         return []
+
+    # 优先从结构化段落提取：关键点/提示
+    m = re.search(
+        r'(?:【(?:关键点|提示)】|(?:关键点|提示)[：:])([\s\S]*?)(?:【建议】|建议[：:]|$)',
+        text
+    )
+    if m:
+        section = m.group(1)
+        lines = [re.sub(r'^[\s\-*•·\d.、()（）]+', '', x).strip() for x in section.split('\n')]
+        items = [x for x in lines if 5 < len(x) < 100]
+        if items:
+            return items[:3]
     
     key_points = []
     
@@ -205,6 +217,15 @@ def extract_suggestions_from_text(text: str) -> List[str]:
     """从自然语言文本中提取建议"""
     if not text:
         return []
+
+    # 优先从结构化段落提取：建议
+    m = re.search(r'(?:【建议】|建议[：:])([\s\S]*?)$', text)
+    if m:
+        section = m.group(1)
+        lines = [re.sub(r'^[\s\-*•·\d.、()（）]+', '', x).strip() for x in section.split('\n')]
+        items = [x for x in lines if 5 < len(x) < 150]
+        if items:
+            return items[:2]
     
     suggestions = []
     
@@ -289,11 +310,22 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
     
     # 收集完整的响应
     full_response = []
+    # 仅向前端流式输出正文，屏蔽末尾结构化段落（关键点/建议）
+    struct_markers = ["【关键点】", "关键点：", "【提示】", "提示："]
+    hold_len = max(len(m) for m in struct_markers) - 1
+    stream_buffer = ""
+    structured_started = False
     
     try:
         async for event in agent_executor.astream_events(
             {
-                "input": enhanced_query,  # 使用增强后的查询
+                "input": (
+                    enhanced_query
+                    + "\n\n请在回答末尾严格追加以下结构化段落：\n"
+                    + "【关键点】\n- 关键点1\n- 关键点2\n- 关键点3\n"
+                    + "【建议】\n- 建议1\n- 建议2\n"
+                    + "要求：每条一句话，简洁可执行。"
+                ),  # 使用增强后的查询并要求结构化输出
                 "chat_history": chat_history,
             },
             version="v1"
@@ -303,13 +335,43 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
                 chunk = event["data"]["chunk"]
                 if chunk.content:
                     full_response.append(chunk.content)
-                    
-                    # 实时流式输出
-                    yield {
-                        "type": "streaming",
-                        "content": chunk.content,
-                        "is_final": False
-                    }
+                    stream_buffer += chunk.content
+
+                    # 首次检测到结构化段落后，不再向前端透传其后内容
+                    if not structured_started:
+                        marker_pos = -1
+                        for marker in struct_markers:
+                            pos = stream_buffer.find(marker)
+                            if pos != -1 and (marker_pos == -1 or pos < marker_pos):
+                                marker_pos = pos
+
+                        if marker_pos != -1:
+                            structured_started = True
+                            visible = stream_buffer[:marker_pos]
+                            if visible:
+                                yield {
+                                    "type": "streaming",
+                                    "content": visible,
+                                    "is_final": False
+                                }
+                            stream_buffer = ""
+                        elif len(stream_buffer) > hold_len:
+                            visible = stream_buffer[:-hold_len]
+                            if visible:
+                                yield {
+                                    "type": "streaming",
+                                    "content": visible,
+                                    "is_final": False
+                                }
+                            stream_buffer = stream_buffer[-hold_len:]
+
+        # 若未进入结构化段落，补发缓冲区余量
+        if stream_buffer and not structured_started:
+            yield {
+                "type": "streaming",
+                "content": stream_buffer,
+                "is_final": False
+            }
 
         # 整合完整响应
         final_content = "".join(full_response)
@@ -321,6 +383,13 @@ async def stream_reply(history: list[dict[str, str]]) -> AsyncIterator[Dict[str,
         # 自动提取关键点和建议
         key_points = extract_key_points_from_text(final_content)
         suggestions = extract_suggestions_from_text(final_content)
+
+        # 最终正文也去掉结构化段落，避免前端正文与卡片重复
+        for marker in struct_markers:
+            pos = final_content.find(marker)
+            if pos != -1:
+                final_content = final_content[:pos].rstrip()
+                break
         
         # 最终结构化输出
         structured_output = {
