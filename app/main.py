@@ -10,7 +10,32 @@ from pydantic import BaseModel, Field
 
 from app.agent import stream_reply
 
-app = FastAPI(title="大学生职业规划智能体", version="0.1.0")
+# postgreSQL
+from contextlib import asynccontextmanager
+from app.database.session import engine, Base
+from app.utils.redis_client import init_redis, close_redis
+from app.routers import auth
+import os
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时
+    await init_redis(os.getenv("REDIS_URL"))
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    
+    yield
+    
+    # 关闭时
+    await close_redis()
+    await engine.dispose()
+
+
+app = FastAPI(
+    title="大学生职业规划智能体", 
+    version="0.1.0",
+    lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,6 +47,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# 路由挂载
+app.include_router(auth.router)
 
 
 class ChatMessage(BaseModel):
@@ -57,12 +84,12 @@ async def sse_stream(history: list[dict[str, str]]) -> AsyncIterator[str]:
     yield "data: [DONE]\n\n"
 
 
-@app.get("/api/health")
+@app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/chat/stream")
+@app.post("/chat/stream")
 async def chat_stream(body: ChatRequest):
     if not body.messages:
         raise HTTPException(status_code=400, detail="messages 不能为空")
