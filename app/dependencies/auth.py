@@ -10,6 +10,7 @@ from app.models.user import User
 
 security = HTTPBearer()
 
+# 从token中解析 user_id
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db)
