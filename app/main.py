@@ -10,6 +10,7 @@ from app.database.session import engine, Base
 from app.utils.redis_client import init_redis, close_redis
 from app.routers import auth
 from app.routers.chat import router as chat_router
+from app.routers.career import router as career_router
 import os
 
 @asynccontextmanager
@@ -45,6 +46,7 @@ app.add_middleware(
 # 路由挂载
 app.include_router(auth.router)
 app.include_router(chat_router)
+app.include_router(career_router)
 
 
 @app.get("/health")
