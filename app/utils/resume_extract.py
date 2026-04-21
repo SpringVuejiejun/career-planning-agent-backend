@@ -36,19 +36,38 @@ def extract_text_from_upload(filename: Optional[str], content_type: Optional[str
 
     # PDF
     if ext == "pdf" or ct in ("application/pdf",):
+        # 优先：PyMuPDF（速度快、效果好）
         try:
             import fitz  # PyMuPDF
-        except Exception:
-            return "", "pdf"
-        try:
+
             doc = fitz.open(stream=raw, filetype="pdf")
             parts = []
             for page in doc:
                 parts.append(page.get_text("text"))
             text = "\n".join(parts).strip()
-            return text, "pdf"
+            if text:
+                return text, "pdf(pymupdf)"
         except Exception:
-            return "", "pdf"
+            pass
+
+        # 兜底：pypdf（纯 Python，对部分 PDF 更稳）
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(raw))
+            parts = []
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                if t.strip():
+                    parts.append(t)
+            text = "\n".join(parts).strip()
+            if text:
+                return text, "pdf(pypdf)"
+        except Exception:
+            pass
+
+        # 多数扫描件 PDF 没有文本层，只能 OCR
+        return "", "pdf(no_text_layer)"
 
     # DOCX
     if ext == "docx" or ct in (

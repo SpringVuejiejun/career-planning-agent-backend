@@ -196,9 +196,10 @@ async def create_student_profile_resume_upload(
     if extracted.strip():
         merged = f"{merged}\n\n{extracted}".strip()
     if len(merged) < 10:
+        scanned_hint = "（该 PDF 可能是扫描件图片版，通常没有可提取的文本层）" if "no_text_layer" in method else ""
         raise HTTPException(
             status_code=400,
-            detail=f"简历内容为空或无法解析（类型：{method}）。请上传 txt/pdf/docx，或粘贴文本到补充说明。",
+            detail=f"简历内容为空或无法解析（类型：{method}）{scanned_hint}。请上传 txt/pdf/docx，或粘贴文本到补充说明。",
         )
 
     profile = await build_student_profile_from_text(
